@@ -17,8 +17,11 @@ constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
+using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::row_major>;
+using FragB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::col_major>;
+
 // M is not constexpr-d because tokens * batch can vary, but the rest of the problem size is fixed for specific configs
-template <int BlockRowWarps, int BlockColWarps, int WarpRowTiles, int WarpColTiles, int ChunkK, int NumStages, int kK, int kN>
+template <int BlockRowWarps, int BlockColWarps, int WarpRowTiles, int WarpColTiles, int ChunkK, int NumStages, int PipelineStrategy, int kK, int kN>
 struct IGemmConfig
 {
     static constexpr int kBlockRowWarps = BlockRowWarps;
@@ -27,6 +30,7 @@ struct IGemmConfig
     static constexpr int kWarpColTiles = WarpColTiles;
     static constexpr int kChunkK = ChunkK;
     static constexpr int kNumStages = NumStages;
+    static constexpr int kPipelineStrategy = PipelineStrategy;
 
     // Derived constants
     static constexpr int kBlockRowTiles = kWarpRowTiles * kBlockRowWarps;
@@ -62,7 +66,6 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 
     // Calculate warp and lane IDs
     int warp_id = threadIdx.x / WARP_SIZE;
-    int lane_id = threadIdx.x % WARP_SIZE;
     int warp_row = warp_id / Config::kBlockColWarps;
     int warp_col = warp_id % Config::kBlockColWarps;
 
@@ -70,8 +73,8 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
     int block_row_start = blockIdx.x * Config::kTileSizeM;
     int block_col_start = blockIdx.y * Config::kTileSizeN;
 
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::row_major> a_frag[Config::kWarpRowTiles];
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::col_major> b_frag[Config::kWarpColTiles];
+    FragA a_frag[Config::kWarpRowTiles];
+    FragB b_frag[Config::kWarpColTiles];
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> c_frag[Config::kWarpRowTiles][Config::kWarpColTiles];
 
     // Initialize accumulator fragments
@@ -127,8 +130,6 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 
                 if (row < M && col < Config::N)
                 {
-
-                    // Store the result directly to global memory using wmma::store_matrix_sync
                     nvcuda::wmma::store_matrix_sync(
                         gmemC.get_ptr(row, col),
                         c_frag[i][j],
@@ -140,29 +141,83 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
         __syncthreads();
     };
 
-    // Main loop with pipelining
-    for (int k = 0; k < Config::K; k += Config::kTileSizeK * Config::kNumStages)
+    auto pipeline_strategy_0 = [&]()
     {
-        // Prefetch stages
-        for (int s = 0; s < Config::kNumStages - 1; s++)
+        // Main loop with pipelining
+        for (int k = 0; k < Config::K; k += Config::kTileSizeK * Config::kNumStages)
         {
-            load_A_tile(s, k + s * Config::kTileSizeK);
-            load_B_tile(s, k + s * Config::kTileSizeK);
-            __pipeline_commit();
+            // Prefetch stages
+            for (int s = 0; s < Config::kNumStages - 1; s++)
+            {
+                load_A_tile(s, k + s * Config::kTileSizeK);
+                load_B_tile(s, k + s * Config::kTileSizeK);
+                __pipeline_commit();
+            }
+            __pipeline_wait_prior(Config::kNumStages - 2);
+            __syncthreads();
+
+            // Main computation loop
+            for (int s = 0; s < Config::kNumStages; s++)
+            {
+                int current_k = k + s * Config::kTileSizeK;
+
+                // Load next stage if available
+                if (s < Config::kNumStages - 1)
+                {
+                    load_A_tile((s + Config::kNumStages - 1) % Config::kNumStages, current_k + Config::kTileSizeK);
+                    load_B_tile((s + Config::kNumStages - 1) % Config::kNumStages, current_k + Config::kTileSizeK);
+                    __pipeline_commit();
+                }
+
+                // Compute using current stage
+                for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+                {
+                    // Load A and B fragments
+                    for (int i = 0; i < Config::kWarpRowTiles; i++)
+                    {
+                        nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(s, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                    }
+
+                    for (int j = 0; j < Config::kWarpColTiles; j++)
+                    {
+                        nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(s, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                    }
+
+                    // Perform matrix multiplication
+                    for (int i = 0; i < Config::kWarpRowTiles; i++)
+                    {
+                        for (int j = 0; j < Config::kWarpColTiles; j++)
+                        {
+                            nvcuda::wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+                        }
+                    }
+                }
+
+                __pipeline_wait_prior(Config::kNumStages - 2);
+                __syncthreads();
+            }
         }
-        __pipeline_wait_prior(Config::kNumStages - 2);
+    };
+
+    // Strategy 1: Overlapped computation and loading
+    auto pipeline_strategy_1 = [&]()
+    {
+        // Load first stage
+        load_A_tile(0, 0);
+        load_B_tile(0, 0);
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
         __syncthreads();
 
-        // Main computation loop
-        for (int s = 0; s < Config::kNumStages; s++)
+        int current_stage = 0;
+        for (int k = 0; k < Config::K; k += Config::kTileSizeK)
         {
-            int current_k = k + s * Config::kTileSizeK;
-
-            // Load next stage if available
-            if (s < Config::kNumStages - 1)
+            // Start loading next stage if available
+            if (k + Config::kTileSizeK < Config::K)
             {
-                load_A_tile((s + Config::kNumStages - 1) % Config::kNumStages, current_k + Config::kTileSizeK);
-                load_B_tile((s + Config::kNumStages - 1) % Config::kNumStages, current_k + Config::kTileSizeK);
+                int next_stage = 1 - current_stage;
+                load_A_tile(next_stage, k + Config::kTileSizeK);
+                load_B_tile(next_stage, k + Config::kTileSizeK);
                 __pipeline_commit();
             }
 
@@ -172,12 +227,14 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
                 // Load A and B fragments
                 for (int i = 0; i < Config::kWarpRowTiles; i++)
                 {
-                    nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(s, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                    nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                    // ldsm8(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
                 }
 
                 for (int j = 0; j < Config::kWarpColTiles; j++)
                 {
-                    nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(s, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                    nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                    // ldsm8(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
                 }
 
                 // Perform matrix multiplication
@@ -190,9 +247,148 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
                 }
             }
 
-            __pipeline_wait_prior(Config::kNumStages - 2);
+            // Wait for next stage to finish loading
+            __pipeline_wait_prior(0);
+            __syncthreads();
+
+            // Swap stages
+            current_stage = 1 - current_stage;
+        }
+    };
+
+    auto pipeline_strategy_2 = [&]()
+    {
+        // Prefetch first stage
+        load_A_tile(0, 0);
+        load_B_tile(0, 0);
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        for (int k = 0; k < Config::K; k += Config::kTileSizeK)
+        {
+            int current_stage = k / Config::kTileSizeK % Config::kNumStages;
+            int next_stage = (current_stage + 1) % Config::kNumStages;
+
+            // Prefetch next stage if available
+            if (k + Config::kTileSizeK < Config::K)
+            {
+                load_A_tile(next_stage, k + Config::kTileSizeK);
+                load_B_tile(next_stage, k + Config::kTileSizeK);
+                __pipeline_commit();
+            }
+
+            // Compute using current stage
+            for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+            {
+                for (int i = 0; i < Config::kWarpRowTiles; i++)
+                {
+                    nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                }
+
+                for (int j = 0; j < Config::kWarpColTiles; j++)
+                {
+                    nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                }
+
+                for (int i = 0; i < Config::kWarpRowTiles; i++)
+                {
+                    for (int j = 0; j < Config::kWarpColTiles; j++)
+                    {
+                        nvcuda::wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+                    }
+                }
+            }
+
+            // Wait for next stage to finish loading
+            __pipeline_wait_prior(0);
             __syncthreads();
         }
+    };
+
+    auto pipeline_strategy_3 = [&]()
+    {
+        for (int k = 0; k < Config::K; k += Config::kTileSizeK)
+        {
+            int current_stage = k / Config::kTileSizeK % Config::kNumStages;
+
+            // Load current stage
+            load_A_tile(current_stage, k);
+            load_B_tile(current_stage, k);
+            __pipeline_commit();
+
+            // Compute using previous stage while loading current stage
+            if (k > 0)
+            {
+                int prev_stage = (current_stage - 1 + Config::kNumStages) % Config::kNumStages;
+                for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+                {
+                    for (int i = 0; i < Config::kWarpRowTiles; i++)
+                    {
+                        nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(prev_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                    }
+
+                    for (int j = 0; j < Config::kWarpColTiles; j++)
+                    {
+                        nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(prev_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                    }
+
+                    for (int i = 0; i < Config::kWarpRowTiles; i++)
+                    {
+                        for (int j = 0; j < Config::kWarpColTiles; j++)
+                        {
+                            nvcuda::wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+                        }
+                    }
+                }
+            }
+
+            // Wait for current stage to finish loading
+            __pipeline_wait_prior(0);
+            __syncthreads();
+        }
+
+        // Compute final stage
+        int final_stage = (Config::K / Config::kTileSizeK - 1) % Config::kNumStages;
+        for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+        {
+            for (int i = 0; i < Config::kWarpRowTiles; i++)
+            {
+                nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(final_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+            }
+
+            for (int j = 0; j < Config::kWarpColTiles; j++)
+            {
+                nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(final_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+            }
+
+            for (int i = 0; i < Config::kWarpRowTiles; i++)
+            {
+                for (int j = 0; j < Config::kWarpColTiles; j++)
+                {
+                    nvcuda::wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+                }
+            }
+        }
+    };
+
+    switch (Config::kPipelineStrategy)
+    {
+    case 0:
+        pipeline_strategy_0();
+        break;
+    case 1:
+        pipeline_strategy_1();
+        break;
+    case 2:
+        pipeline_strategy_2();
+        break;
+    case 3:
+        pipeline_strategy_3();
+        break;
+    default:
+        pipeline_strategy_0();
+        break;
     }
 
     // Store results
@@ -219,6 +415,7 @@ void launch_igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 
 void cpu_gemm_int8(const int8_t *A, const int8_t *B, int32_t *C, int M, int N, int K)
 {
+    // return;
     for (int m = 0; m < M; ++m)
     {
         for (int n = 0; n < N; ++n)
@@ -249,9 +446,9 @@ bool compare_results(const int32_t *gpu_result, const int32_t *cpu_result, int s
 int main()
 {
     // Choose matrix dimensions (multiples of 16 for best performance)
-    const int M = 512, N = 8192, K = 8192;
+    const int M = 256, N = 8192, K = 8192;
 
-    using Config = IGemmConfig<4, 2, 4, 4, 4, 2, K, N>;
+    using Config = IGemmConfig<2, 2, 4, 4, 4, 3, 3, K, N>;
 
     // Allocate host memory
     std::vector<int8_t> h_A(M * K);
@@ -276,11 +473,14 @@ int main()
     cudaMalloc(&d_B, K * N * sizeof(int8_t));
     cudaMalloc(&d_C, M * N * sizeof(int32_t));
 
+    int8_t *d_A_shfl, *d_B_shfl;
+    cudaMalloc(&d_A_shfl, M * K * sizeof(int8_t));
+    cudaMalloc(&d_B_shfl, K * N * sizeof(int8_t));
+
     // Copy input data to device
     cudaMemcpy(d_A, h_A.data(), M * K * sizeof(int8_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B.data(), K * N * sizeof(int8_t), cudaMemcpyHostToDevice);
 
-    // Create CUDA events for timing
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
