@@ -219,7 +219,6 @@ void launch_igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 
 void cpu_gemm_int8(const int8_t *A, const int8_t *B, int32_t *C, int M, int N, int K)
 {
-    return;
     for (int m = 0; m < M; ++m)
     {
         for (int n = 0; n < N; ++n)
@@ -250,9 +249,9 @@ bool compare_results(const int32_t *gpu_result, const int32_t *cpu_result, int s
 int main()
 {
     // Choose matrix dimensions (multiples of 16 for best performance)
-    const int M = 4096, N = 4096, K = 4096;
+    const int M = 512, N = 8192, K = 8192;
 
-    using Config = IGemmConfig<4, 2, 4, 4, 4, 2, M, N>;
+    using Config = IGemmConfig<4, 2, 4, 4, 4, 2, K, N>;
 
     // Allocate host memory
     std::vector<int8_t> h_A(M * K);
