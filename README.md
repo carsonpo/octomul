@@ -1,7 +1,7 @@
 # OctoMul — CUDA Int8 Tensor Core GEMM
 
-<div style="text-align: center;">
-<img src="assets/octomul-logo.jpg" width="320">
+<div style="display: flex; justify-content: center;">
+  <img src="assets/octomul-logo.jpg" width="320">
 </div>
 
 This int8 gemm kernel gets speeds faster than cuBLAS FP16 (and occasionally cuBLAS Int8). It's also relatively easy to read, hack, fuse, and do whatever you want with.
