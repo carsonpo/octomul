@@ -1,6 +1,6 @@
 # OctoMul — CUDA Int8 Tensor Core GEMM
 
-<div style="display: flex; justify-content: center;">
+<div align="center">
   <img src="assets/octomul-logo.jpg" width="320">
 </div>
 
