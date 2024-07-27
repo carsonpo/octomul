@@ -7,21 +7,22 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include "helpers.cuh"
+#include "helpers.cu"
+#include "configs.cu"
+#include <cublas_v2.h>
 
 #define div_ru(a, b) (((a) + (b) - 1) / (b))
 
-// CUDA and WMMA constants
-constexpr int WARP_SIZE = 32;
-constexpr int WMMA_M = 16;
-constexpr int WMMA_N = 16;
-constexpr int WMMA_K = 16;
+#define WARP_SIZE 32
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::row_major>;
 using FragB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::col_major>;
 
 // M is not constexpr-d because tokens * batch can vary, but the rest of the problem size is fixed for specific configs
-template <int BlockRowWarps, int BlockColWarps, int WarpRowTiles, int WarpColTiles, int ChunkK, int NumStages, int PipelineStrategy, int kK, int kN>
+template <int BlockRowWarps, int BlockColWarps, int WarpRowTiles, int WarpColTiles, int ChunkK, int NumStages, int PipelineStrategy, int kN, int kK>
 struct IGemmConfig
 {
     static constexpr int kBlockRowWarps = BlockRowWarps;
@@ -396,21 +397,14 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 }
 
 template <typename Config>
-void launch_igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
+void launch_igemm(const int8_t *A, const int8_t *B, int32_t *C, int M, cudaStream_t stream)
 {
     dim3 grid_dim(div_ru(M, Config::kTileSizeM), div_ru(Config::N, Config::kTileSizeN));
     dim3 block_dim(WARP_SIZE * Config::kBlockRowWarps * Config::kBlockColWarps);
 
     size_t shared_mem_size = Config::kNumStages * (Config::kTileSizeM * Config::kTileSizeK * sizeof(int8_t) + Config::kTileSizeN * Config::kTileSizeK * sizeof(int8_t));
 
-    igemm<Config><<<grid_dim, block_dim, shared_mem_size>>>(A, B, C, M);
-    cudaDeviceSynchronize();
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
-    }
+    igemm<Config><<<grid_dim, block_dim, shared_mem_size, stream>>>(A, B, C, M);
 }
 
 void cpu_gemm_int8(const int8_t *A, const int8_t *B, int32_t *C, int M, int N, int K)
@@ -443,101 +437,110 @@ bool compare_results(const int32_t *gpu_result, const int32_t *cpu_result, int s
     return true;
 }
 
-int main()
+#define LAUNCH_KERNEL_IF_CONDITION(config, mCond, nCond, kCond)                                                              \
+    else if (n == nCond && m == mCond && k == kCond)                                                                         \
+    {                                                                                                                        \
+        using ThisConfig = IGemmConfig<config.BlockRowWarps, config.BlockColWarps, config.WarpRowTiles, config.WarpColTiles, \
+                                       config.ChunkK, config.NumStages, config.PipelineStrategy, config.N, config.K>;        \
+        launch_igemm<ThisConfig>(A_ptr, B_ptr, C_ptr, m, stream);                                                            \
+        return;                                                                                                              \
+    }
+
+void wrapper(void *A, void *B, void *C, const int m, const int n, const int k, cudaStream_t stream)
 {
-    // Choose matrix dimensions (multiples of 16 for best performance)
-    const int M = 256, N = 8192, K = 8192;
+    const int8_t *A_ptr = reinterpret_cast<const int8_t *>(A);
+    const int8_t *B_ptr = reinterpret_cast<const int8_t *>(B);
+    int32_t *C_ptr = reinterpret_cast<int32_t *>(C);
 
-    using Config = IGemmConfig<2, 2, 4, 4, 4, 3, 3, K, N>;
-
-    // Allocate host memory
-    std::vector<int8_t> h_A(M * K);
-    std::vector<int8_t> h_B(K * N);
-    std::vector<int32_t> h_C_gpu(M * N);
-    std::vector<int32_t> h_C_cpu(M * N);
-
-    // Initialize input matrices with random data
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(-4, 4);
-
-    std::generate(h_A.begin(), h_A.end(), [&]()
-                  { return static_cast<int8_t>(dis(gen)); });
-    std::generate(h_B.begin(), h_B.end(), [&]()
-                  { return static_cast<int8_t>(dis(gen)); });
-
-    // Allocate device memory
-    int8_t *d_A, *d_B;
-    int32_t *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(int8_t));
-    cudaMalloc(&d_B, K * N * sizeof(int8_t));
-    cudaMalloc(&d_C, M * N * sizeof(int32_t));
-
-    int8_t *d_A_shfl, *d_B_shfl;
-    cudaMalloc(&d_A_shfl, M * K * sizeof(int8_t));
-    cudaMalloc(&d_B_shfl, K * N * sizeof(int8_t));
-
-    // Copy input data to device
-    cudaMemcpy(d_A, h_A.data(), M * K * sizeof(int8_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B.data(), K * N * sizeof(int8_t), cudaMemcpyHostToDevice);
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    constexpr int numWarmups = 10;
-    constexpr int numTrials = 100;
-
-    for (int i = 0; i < numWarmups; ++i)
+    if (false)
     {
-        launch_igemm<Config>(d_A, d_B, d_C, M);
+    }
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_57344_8192, 4096, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_8192_8192, 4096, 8192, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_28672_4096, 4096, 28672, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_10240_8192, 4096, 10240, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_6144_4096, 4096, 6144, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_4096_4096, 4096, 4096, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_8192_28672, 2048, 8192, 28672)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_10240_8192, 2048, 10240, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_8192_8192, 2048, 8192, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_28672_4096, 2048, 28672, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_6144_4096, 2048, 6144, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_4096_4096, 2048, 4096, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_8192_28672, 1024, 8192, 28672)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_6144_4096, 1024, 6144, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_4096_14336, 4096, 4096, 14336)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_57344_8192, 2048, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_57344_8192, 1024, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_6144_4096, 512, 6144, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_4096_14336, 1024, 4096, 14336)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_28672_4096, 1024, 28672, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_4096_14336, 2048, 4096, 14336)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_57344_8192, 512, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_8192_28672, 512, 8192, 28672)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_4096_4096, 512, 4096, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_28672_4096, 512, 28672, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_8192_28672, 4096, 8192, 28672)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_4096_14336, 512, 4096, 14336)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_8192_8192, 512, 8192, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_10240_8192, 512, 10240, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_10240_8192, 1024, 10240, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_4096_4096, 1024, 4096, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_8192_8192, 1024, 8192, 8192)
+}
+
+cublasHandle_t g_cublas_handle = nullptr;
+
+void init_cublas()
+{
+    if (g_cublas_handle == nullptr)
+    {
+        cublasStatus_t status = cublasCreate(&g_cublas_handle);
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            printf("cuBLAS initialization failed with error code %d\n", status);
+        }
+    }
+}
+
+void destroy_cublas()
+{
+    if (g_cublas_handle != nullptr)
+    {
+        cublasDestroy(g_cublas_handle);
+        g_cublas_handle = nullptr;
+    }
+}
+
+void cublas_igemm(const int8_t *A, const int8_t *B, int32_t *C, int M, int N, int K, cudaStream_t stream)
+{
+    if (g_cublas_handle == nullptr)
+    {
+        printf("cuBLAS handle not initialized\n");
+        return;
     }
 
-    cudaDeviceSynchronize();
-
-    // Launch GPU kernel
-    cudaEventRecord(start);
-    for (int i = 0; i < numTrials; ++i)
+    cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
+    if (status != CUBLAS_STATUS_SUCCESS)
     {
-        launch_igemm<Config>(d_A, d_B, d_C, M);
-    }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-
-    // Calculate TOPS
-    double seconds = milliseconds / 1000.0;
-    double operations = static_cast<double>(M) * N * K * 2 * numTrials; // 2 ops per multiply-add
-    double tops = operations / (seconds * 1e12);
-
-    std::cout << "GPU Performance: " << tops << " TOPS" << std::endl;
-
-    // Copy result back to host
-    cudaMemcpy(h_C_gpu.data(), d_C, M * N * sizeof(int32_t), cudaMemcpyDeviceToHost);
-
-    // Compute CPU result (commented out for performance)
-    cpu_gemm_int8(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K);
-
-    // Compare results (commented out for performance)
-    bool results_match = compare_results(h_C_gpu.data(), h_C_cpu.data(), M * N);
-
-    if (results_match)
-    {
-        std::cout << "Results match! The WMMA GEMM implementation is correct." << std::endl;
-    }
-    else
-    {
-        std::cout << "Results do not match. There might be an error in the WMMA GEMM implementation." << std::endl;
+        printf("cuBLAS set stream failed with error code %d\n", status);
+        return;
     }
 
-    // Clean up
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
 
-    return 0;
+    status = cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                          N, M, K,
+                          &alpha,
+                          B, CUDA_R_8I, K,
+                          A, CUDA_R_8I, K,
+                          &beta,
+                          C, CUDA_R_32I, N,
+                          CUDA_R_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        printf("cuBLAS GEMM failed with error code %d\n", status);
+    }
 }
