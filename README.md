@@ -1,6 +1,6 @@
 # OctoMul — CUDA Int8 Tensor Core GEMM
 
-![OctoMul Logo](assets/octomul-logo.jpg | width=512)
+<img src="assets/octomul-logo.jpg" width="320">
 
 This int8 gemm kernel gets speeds faster than cuBLAS FP16 (and occasionally cuBLAS Int8). It's also relatively easy to read, hack, fuse, and do whatever you want with.
 
@@ -11,7 +11,7 @@ You can install it for yourself with `pip install .` and then run the tests with
 
 I tuned for kernels for an A40, so if you're using another device the configs might be less than optimal and you'd need to autotune them for said device.
 
-Talk is cheap though, benchmarks are in /benchmarks:
+Talk is cheap though, benchmarks are in `/benchmarks`:
 
 
 I'm still working on improving the kernel so I hope to reach parity with cuBLAS on int8 fully.
