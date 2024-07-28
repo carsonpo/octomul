@@ -8,21 +8,21 @@
 #include <cmath>
 #include <chrono>
 #include "helpers.cu"
+#include <iostream>
+#include <vector>
+#include <cstdint>
 #include "configs.cu"
-#include <cublas_v2.h>
+#include "cublas_v2.h"
+
+#define div_ru(a, b) (((a) + (b) - 1) / (b))
 
 #define div_ru(a, b) (((a) + (b) - 1) / (b))
 
 #define WARP_SIZE 32
-#define WMMA_M 16
-#define WMMA_N 16
-#define WMMA_K 16
-
-using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::row_major>;
-using FragB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, int8_t, nvcuda::wmma::col_major>;
+#define DEBUG false
 
 // M is not constexpr-d because tokens * batch can vary, but the rest of the problem size is fixed for specific configs
-template <int BlockRowWarps, int BlockColWarps, int WarpRowTiles, int WarpColTiles, int ChunkK, int NumStages, int PipelineStrategy, int kN, int kK>
+template <int BlockRowWarps, int BlockColWarps, int WarpRowTiles, int WarpColTiles, int ChunkK, int NumStages, int PipelineStrategy, int kWMMA_M, int kWMMA_N, int kWMMA_K, int kN, int kK>
 struct IGemmConfig
 {
     static constexpr int kBlockRowWarps = BlockRowWarps;
@@ -37,14 +37,17 @@ struct IGemmConfig
     static constexpr int kBlockRowTiles = kWarpRowTiles * kBlockRowWarps;
     static constexpr int kBlockColTiles = kWarpColTiles * kBlockColWarps;
 
-    static constexpr int kTileSizeM = WMMA_M * kBlockRowTiles;
-    static constexpr int kTileSizeN = WMMA_N * kBlockColTiles;
-    static constexpr int kTileSizeK = WMMA_K * kChunkK;
+    static constexpr int kTileSizeM = kWMMA_M * kBlockRowTiles;
+    static constexpr int kTileSizeN = kWMMA_N * kBlockColTiles;
+    static constexpr int kTileSizeK = kWMMA_K * kChunkK;
 
     static constexpr int kSharedMemSize = kTileSizeM * kTileSizeK + kTileSizeN * kTileSizeK;
 
     static constexpr int K = kK;
     static constexpr int N = kN;
+    static constexpr int WMMA_M = kWMMA_M;
+    static constexpr int WMMA_N = kWMMA_N;
+    static constexpr int WMMA_K = kWMMA_K;
 };
 
 // 128-bit vector type for efficient memory loads
@@ -55,6 +58,9 @@ template <typename Config>
 __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 {
     extern __shared__ int8_t shared_memory[];
+
+    using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, Config::WMMA_M, Config::WMMA_N, Config::WMMA_K, int8_t, nvcuda::wmma::row_major>;
+    using FragB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, Config::WMMA_M, Config::WMMA_N, Config::WMMA_K, int8_t, nvcuda::wmma::col_major>;
 
     // Set up shared memory tensors for A and B with multiple stages
     SmemTensor3D<int8_t, Config::kNumStages, Config::kTileSizeM, Config::kTileSizeK> smemA(shared_memory);
@@ -76,7 +82,7 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 
     FragA a_frag[Config::kWarpRowTiles];
     FragB b_frag[Config::kWarpColTiles];
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> c_frag[Config::kWarpRowTiles][Config::kWarpColTiles];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, Config::WMMA_M, Config::WMMA_N, Config::WMMA_K, int32_t> c_frag[Config::kWarpRowTiles][Config::kWarpColTiles];
 
     // Initialize accumulator fragments
     for (int i = 0; i < Config::kWarpRowTiles; i++)
@@ -126,8 +132,8 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
         {
             for (int j = 0; j < Config::kWarpColTiles; j++)
             {
-                int row = block_row_start + (warp_row * Config::kWarpRowTiles + i) * WMMA_M;
-                int col = block_col_start + (warp_col * Config::kWarpColTiles + j) * WMMA_N;
+                int row = block_row_start + (warp_row * Config::kWarpRowTiles + i) * Config::WMMA_M;
+                int col = block_col_start + (warp_col * Config::kWarpColTiles + j) * Config::WMMA_N;
 
                 if (row < M && col < Config::N)
                 {
@@ -171,17 +177,17 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
                 }
 
                 // Compute using current stage
-                for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+                for (int kk = 0; kk < Config::kTileSizeK; kk += Config::WMMA_K)
                 {
                     // Load A and B fragments
                     for (int i = 0; i < Config::kWarpRowTiles; i++)
                     {
-                        nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(s, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                        nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(s, warp_row * Config::kWarpRowTiles * Config::WMMA_M + i * Config::WMMA_M, kk), Config::kTileSizeK);
                     }
 
                     for (int j = 0; j < Config::kWarpColTiles; j++)
                     {
-                        nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(s, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                        nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(s, warp_col * Config::kWarpColTiles * Config::WMMA_N + j * Config::WMMA_N, kk), Config::kTileSizeK);
                     }
 
                     // Perform matrix multiplication
@@ -223,18 +229,18 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
             }
 
             // Compute using current stage
-            for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+            for (int kk = 0; kk < Config::kTileSizeK; kk += Config::WMMA_K)
             {
                 // Load A and B fragments
                 for (int i = 0; i < Config::kWarpRowTiles; i++)
                 {
-                    nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                    nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * Config::WMMA_M + i * Config::WMMA_M, kk), Config::kTileSizeK);
                     // ldsm8(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
                 }
 
                 for (int j = 0; j < Config::kWarpColTiles; j++)
                 {
-                    nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                    nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * Config::WMMA_N + j * Config::WMMA_N, kk), Config::kTileSizeK);
                     // ldsm8(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
                 }
 
@@ -280,16 +286,16 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
             }
 
             // Compute using current stage
-            for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+            for (int kk = 0; kk < Config::kTileSizeK; kk += Config::WMMA_K)
             {
                 for (int i = 0; i < Config::kWarpRowTiles; i++)
                 {
-                    nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                    nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(current_stage, warp_row * Config::kWarpRowTiles * Config::WMMA_M + i * Config::WMMA_M, kk), Config::kTileSizeK);
                 }
 
                 for (int j = 0; j < Config::kWarpColTiles; j++)
                 {
-                    nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                    nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(current_stage, warp_col * Config::kWarpColTiles * Config::WMMA_N + j * Config::WMMA_N, kk), Config::kTileSizeK);
                 }
 
                 for (int i = 0; i < Config::kWarpRowTiles; i++)
@@ -322,16 +328,16 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
             if (k > 0)
             {
                 int prev_stage = (current_stage - 1 + Config::kNumStages) % Config::kNumStages;
-                for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+                for (int kk = 0; kk < Config::kTileSizeK; kk += Config::WMMA_K)
                 {
                     for (int i = 0; i < Config::kWarpRowTiles; i++)
                     {
-                        nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(prev_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                        nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(prev_stage, warp_row * Config::kWarpRowTiles * Config::WMMA_M + i * Config::WMMA_M, kk), Config::kTileSizeK);
                     }
 
                     for (int j = 0; j < Config::kWarpColTiles; j++)
                     {
-                        nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(prev_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                        nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(prev_stage, warp_col * Config::kWarpColTiles * Config::WMMA_N + j * Config::WMMA_N, kk), Config::kTileSizeK);
                     }
 
                     for (int i = 0; i < Config::kWarpRowTiles; i++)
@@ -351,16 +357,16 @@ __global__ void igemm(const int8_t *A, const int8_t *B, int32_t *C, int M)
 
         // Compute final stage
         int final_stage = (Config::K / Config::kTileSizeK - 1) % Config::kNumStages;
-        for (int kk = 0; kk < Config::kTileSizeK; kk += WMMA_K)
+        for (int kk = 0; kk < Config::kTileSizeK; kk += Config::WMMA_K)
         {
             for (int i = 0; i < Config::kWarpRowTiles; i++)
             {
-                nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(final_stage, warp_row * Config::kWarpRowTiles * WMMA_M + i * WMMA_M, kk), Config::kTileSizeK);
+                nvcuda::wmma::load_matrix_sync(a_frag[i], smemA.get_ptr(final_stage, warp_row * Config::kWarpRowTiles * Config::WMMA_M + i * Config::WMMA_M, kk), Config::kTileSizeK);
             }
 
             for (int j = 0; j < Config::kWarpColTiles; j++)
             {
-                nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(final_stage, warp_col * Config::kWarpColTiles * WMMA_N + j * WMMA_N, kk), Config::kTileSizeK);
+                nvcuda::wmma::load_matrix_sync(b_frag[j], smemB.get_ptr(final_stage, warp_col * Config::kWarpColTiles * Config::WMMA_N + j * Config::WMMA_N, kk), Config::kTileSizeK);
             }
 
             for (int i = 0; i < Config::kWarpRowTiles; i++)
@@ -402,9 +408,19 @@ void launch_igemm(const int8_t *A, const int8_t *B, int32_t *C, int M, cudaStrea
     dim3 grid_dim(div_ru(M, Config::kTileSizeM), div_ru(Config::N, Config::kTileSizeN));
     dim3 block_dim(WARP_SIZE * Config::kBlockRowWarps * Config::kBlockColWarps);
 
+    // printf("grid_dim x: %d, block_dim x: %d, grid_dim y: %d, block_dim y: %d\n", grid_dim.x, block_dim.x, grid_dim.y, block_dim.y);
+    // printf("M: %d, N: %d, K: %d\n", M, Config::N, Config::K);
+
     size_t shared_mem_size = Config::kNumStages * (Config::kTileSizeM * Config::kTileSizeK * sizeof(int8_t) + Config::kTileSizeN * Config::kTileSizeK * sizeof(int8_t));
 
     igemm<Config><<<grid_dim, block_dim, shared_mem_size, stream>>>(A, B, C, M);
+    // cudaDeviceSynchronize();
+
+    // cudaError_t err = cudaGetLastError();
+    // if (err != cudaSuccess)
+    // {
+    //     std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
+    // }
 }
 
 void cpu_gemm_int8(const int8_t *A, const int8_t *B, int32_t *C, int M, int N, int K)
@@ -437,13 +453,13 @@ bool compare_results(const int32_t *gpu_result, const int32_t *cpu_result, int s
     return true;
 }
 
-#define LAUNCH_KERNEL_IF_CONDITION(config, mCond, nCond, kCond)                                                              \
-    else if (n == nCond && m == mCond && k == kCond)                                                                         \
-    {                                                                                                                        \
-        using ThisConfig = IGemmConfig<config.BlockRowWarps, config.BlockColWarps, config.WarpRowTiles, config.WarpColTiles, \
-                                       config.ChunkK, config.NumStages, config.PipelineStrategy, config.N, config.K>;        \
-        launch_igemm<ThisConfig>(A_ptr, B_ptr, C_ptr, m, stream);                                                            \
-        return;                                                                                                              \
+#define LAUNCH_KERNEL_IF_CONDITION(config, mCond, nCond, kCond)                                                                                                       \
+    else if (n == nCond && m == mCond && k == kCond)                                                                                                                  \
+    {                                                                                                                                                                 \
+        using ThisConfig = IGemmConfig<config.BlockRowWarps, config.BlockColWarps, config.WarpRowTiles, config.WarpColTiles,                                          \
+                                       config.ChunkK, config.NumStages, config.PipelineStrategy, config.kWMMA_M, config.kWMMA_N, config.kWMMA_K, config.N, config.K>; \
+        launch_igemm<ThisConfig>(A_ptr, B_ptr, C_ptr, m, stream);                                                                                                     \
+        return;                                                                                                                                                       \
     }
 
 void wrapper(void *A, void *B, void *C, const int m, const int n, const int k, cudaStream_t stream)
@@ -463,30 +479,37 @@ void wrapper(void *A, void *B, void *C, const int m, const int n, const int k, c
     LAUNCH_KERNEL_IF_CONDITION(octomul_4096_4096_4096, 4096, 4096, 4096)
     LAUNCH_KERNEL_IF_CONDITION(octomul_2048_8192_28672, 2048, 8192, 28672)
     LAUNCH_KERNEL_IF_CONDITION(octomul_2048_10240_8192, 2048, 10240, 8192)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_8192_8192, 2048, 8192, 8192)
     LAUNCH_KERNEL_IF_CONDITION(octomul_2048_28672_4096, 2048, 28672, 4096)
     LAUNCH_KERNEL_IF_CONDITION(octomul_2048_6144_4096, 2048, 6144, 4096)
     LAUNCH_KERNEL_IF_CONDITION(octomul_2048_4096_4096, 2048, 4096, 4096)
     LAUNCH_KERNEL_IF_CONDITION(octomul_1024_8192_28672, 1024, 8192, 28672)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_8192_8192, 1024, 8192, 8192)
     LAUNCH_KERNEL_IF_CONDITION(octomul_1024_6144_4096, 1024, 6144, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_512_10240_8192, 512, 10240, 8192)
     LAUNCH_KERNEL_IF_CONDITION(octomul_4096_4096_14336, 4096, 4096, 14336)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_57344_8192, 2048, 57344, 8192)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_57344_8192, 1024, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_10240_8192, 1024, 10240, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_4096_4096, 1024, 4096, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_28672_4096, 256, 28672, 4096)
     LAUNCH_KERNEL_IF_CONDITION(octomul_512_6144_4096, 512, 6144, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_8192_8192, 2048, 8192, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_6144_4096, 256, 6144, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_10240_8192, 256, 10240, 8192)
     LAUNCH_KERNEL_IF_CONDITION(octomul_1024_4096_14336, 1024, 4096, 14336)
     LAUNCH_KERNEL_IF_CONDITION(octomul_1024_28672_4096, 1024, 28672, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_57344_8192, 256, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_4096_4096, 256, 4096, 4096)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_4096_14336, 256, 4096, 14336)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_2048_57344_8192, 2048, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_57344_8192, 1024, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_8192_8192, 256, 8192, 8192)
     LAUNCH_KERNEL_IF_CONDITION(octomul_2048_4096_14336, 2048, 4096, 14336)
     LAUNCH_KERNEL_IF_CONDITION(octomul_512_57344_8192, 512, 57344, 8192)
+    LAUNCH_KERNEL_IF_CONDITION(octomul_256_8192_28672, 256, 8192, 28672)
     LAUNCH_KERNEL_IF_CONDITION(octomul_512_8192_28672, 512, 8192, 28672)
     LAUNCH_KERNEL_IF_CONDITION(octomul_512_4096_4096, 512, 4096, 4096)
     LAUNCH_KERNEL_IF_CONDITION(octomul_512_28672_4096, 512, 28672, 4096)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_4096_8192_28672, 4096, 8192, 28672)
     LAUNCH_KERNEL_IF_CONDITION(octomul_512_4096_14336, 512, 4096, 14336)
     LAUNCH_KERNEL_IF_CONDITION(octomul_512_8192_8192, 512, 8192, 8192)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_512_10240_8192, 512, 10240, 8192)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_10240_8192, 1024, 10240, 8192)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_4096_4096, 1024, 4096, 4096)
-    LAUNCH_KERNEL_IF_CONDITION(octomul_1024_8192_8192, 1024, 8192, 8192)
 }
 
 cublasHandle_t g_cublas_handle = nullptr;
